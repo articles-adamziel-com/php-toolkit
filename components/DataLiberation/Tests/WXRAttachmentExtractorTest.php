@@ -10,6 +10,18 @@ use WordPress\XML\XMLProcessor;
 class WXRAttachmentExtractorTest extends TestCase {
 
 	/**
+	 * All known WXR namespace URI variants for use in test helpers.
+	 */
+	private static $wxr_namespace_uris = array(
+		'http://wordpress.org/export/1.0/',
+		'https://wordpress.org/export/1.0/',
+		'http://wordpress.org/export/1.1/',
+		'https://wordpress.org/export/1.1/',
+		'http://wordpress.org/export/1.2/',
+		'https://wordpress.org/export/1.2/',
+	);
+
+	/**
 	 * Helper: run the extractor on a WXR string and return the output XML.
 	 */
 	private function run_extractor( string $wxr_input ): string {
@@ -60,26 +72,28 @@ class WXRAttachmentExtractorTest extends TestCase {
 	}
 
 	/**
-	 * Helper: count occurrences of a tag value in the output XML.
+	 * Helper: check whether a namespace+local name is wp:post_type in any variant.
+	 */
+	private function is_wxr_tag( string $local_name, string $ns_name ): bool {
+		foreach ( self::$wxr_namespace_uris as $ns ) {
+			if ( '{' . $ns . '}' . $local_name === $ns_name ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Helper: count occurrences of attachment post_type in the output XML.
 	 */
 	private function count_attachment_items( string $xml ): int {
 		$count     = 0;
-		$processor = XMLProcessor::create_from_string(
-			$xml,
-			null,
-			'UTF-8',
-			array(
-				'wp'      => 'http://wordpress.org/export/1.2/',
-				'content' => 'http://purl.org/rss/1.0/modules/content/',
-				'dc'      => 'http://purl.org/dc/elements/1.1/',
-				'excerpt' => 'http://wordpress.org/export/1.2/excerpt/',
-			)
-		);
+		$processor = XMLProcessor::create_from_string( $xml );
 		$in_post_type = false;
 		while ( $processor->next_token() ) {
 			if ( '#tag' === $processor->get_token_type() && $processor->is_tag_opener() ) {
 				$ns_name = $processor->get_tag_namespace_and_local_name();
-				if ( '{http://wordpress.org/export/1.2/}post_type' === $ns_name ) {
+				if ( $this->is_wxr_tag( 'post_type', $ns_name ) ) {
 					$in_post_type = true;
 				}
 			} elseif ( $in_post_type && ( '#text' === $processor->get_token_type() || '#cdata-section' === $processor->get_token_type() ) ) {
@@ -99,23 +113,13 @@ class WXRAttachmentExtractorTest extends TestCase {
 	 */
 	private function extract_attachment_urls( string $xml ): array {
 		$urls      = array();
-		$processor = XMLProcessor::create_from_string(
-			$xml,
-			null,
-			'UTF-8',
-			array(
-				'wp'      => 'http://wordpress.org/export/1.2/',
-				'content' => 'http://purl.org/rss/1.0/modules/content/',
-				'dc'      => 'http://purl.org/dc/elements/1.1/',
-				'excerpt' => 'http://wordpress.org/export/1.2/excerpt/',
-			)
-		);
+		$processor = XMLProcessor::create_from_string( $xml );
 		$in_attachment_url = false;
 		$text_buffer       = '';
 		while ( $processor->next_token() ) {
 			if ( '#tag' === $processor->get_token_type() && $processor->is_tag_opener() ) {
 				$ns_name = $processor->get_tag_namespace_and_local_name();
-				if ( '{http://wordpress.org/export/1.2/}attachment_url' === $ns_name ) {
+				if ( $this->is_wxr_tag( 'attachment_url', $ns_name ) ) {
 					$in_attachment_url = true;
 					$text_buffer       = '';
 				}
@@ -318,14 +322,14 @@ class WXRAttachmentExtractorTest extends TestCase {
 		$this->assertEquals( 0, $this->count_attachment_items( $output ) );
 	}
 
-	public function test_css_font_url_not_treated_as_image() {
+	public function test_css_url_extracted_regardless_of_extension() {
+		// With extension filtering removed, all CSS url() values are extracted.
 		$content = '<div style="background-image: url(https://example.com/font.woff2)">text</div>';
 		$input   = $this->wrap_wxr( $this->make_item( 1, $content ) );
 
 		$output = $this->run_extractor( $input );
 
-		// .woff2 is not an image extension, so should be skipped in CSS context.
-		$this->assertEquals( 0, $this->count_attachment_items( $output ) );
+		$this->assertEquals( 1, $this->count_attachment_items( $output ) );
 	}
 
 	// ──────────────────────────────────────────────────────────────
@@ -366,6 +370,54 @@ class WXRAttachmentExtractorTest extends TestCase {
 
 		$urls = $this->extract_attachment_urls( $output );
 		$this->assertContains( 'https://example.com/thumb.jpg', $urls );
+	}
+
+	// ──────────────────────────────────────────────────────────────
+	// New media tag extraction
+	// ──────────────────────────────────────────────────────────────
+
+	public function test_audio_src_is_extracted() {
+		$content = '<audio src="https://example.com/podcast.mp3"></audio>';
+		$input   = $this->wrap_wxr( $this->make_item( 1, $content ) );
+
+		$output = $this->run_extractor( $input );
+
+		$this->assertEquals( 1, $this->count_attachment_items( $output ) );
+		$urls = $this->extract_attachment_urls( $output );
+		$this->assertContains( 'https://example.com/podcast.mp3', $urls );
+	}
+
+	public function test_embed_src_is_extracted() {
+		$content = '<embed src="https://example.com/animation.swf" />';
+		$input   = $this->wrap_wxr( $this->make_item( 1, $content ) );
+
+		$output = $this->run_extractor( $input );
+
+		$this->assertEquals( 1, $this->count_attachment_items( $output ) );
+		$urls = $this->extract_attachment_urls( $output );
+		$this->assertContains( 'https://example.com/animation.swf', $urls );
+	}
+
+	public function test_video_src_is_extracted() {
+		$content = '<video src="https://example.com/clip.mp4"></video>';
+		$input   = $this->wrap_wxr( $this->make_item( 1, $content ) );
+
+		$output = $this->run_extractor( $input );
+
+		$this->assertEquals( 1, $this->count_attachment_items( $output ) );
+		$urls = $this->extract_attachment_urls( $output );
+		$this->assertContains( 'https://example.com/clip.mp4', $urls );
+	}
+
+	public function test_source_src_without_type_is_extracted() {
+		$content = '<video><source src="https://example.com/video.webm" /></video>';
+		$input   = $this->wrap_wxr( $this->make_item( 1, $content ) );
+
+		$output = $this->run_extractor( $input );
+
+		$this->assertEquals( 1, $this->count_attachment_items( $output ) );
+		$urls = $this->extract_attachment_urls( $output );
+		$this->assertContains( 'https://example.com/video.webm', $urls );
 	}
 
 	// ──────────────────────────────────────────────────────────────
@@ -460,7 +512,7 @@ class WXRAttachmentExtractorTest extends TestCase {
 
 		$output = $this->run_extractor( $wxr );
 
-		// The WXR entity reader concatenates multiple CDATA sections.
+		// The XML processor concatenates multiple CDATA sections.
 		// The resulting HTML "<img src="https://example.com/multi-cdata.jpg" />"
 		// should be parsed and the image extracted.
 		$this->assertEquals( 1, $this->count_attachment_items( $output ) );
@@ -659,21 +711,11 @@ class WXRAttachmentExtractorTest extends TestCase {
 
 		// All post IDs should be unique.
 		$ids       = array();
-		$processor = XMLProcessor::create_from_string(
-			$output,
-			null,
-			'UTF-8',
-			array(
-				'wp'      => 'http://wordpress.org/export/1.2/',
-				'content' => 'http://purl.org/rss/1.0/modules/content/',
-				'dc'      => 'http://purl.org/dc/elements/1.1/',
-				'excerpt' => 'http://wordpress.org/export/1.2/excerpt/',
-			)
-		);
+		$processor = XMLProcessor::create_from_string( $output );
 		$in_post_id = false;
 		while ( $processor->next_token() ) {
 			if ( '#tag' === $processor->get_token_type() && $processor->is_tag_opener() ) {
-				if ( '{http://wordpress.org/export/1.2/}post_id' === $processor->get_tag_namespace_and_local_name() ) {
+				if ( $this->is_wxr_tag( 'post_id', $processor->get_tag_namespace_and_local_name() ) ) {
 					$in_post_id = true;
 				}
 			} elseif ( $in_post_id && ( '#text' === $processor->get_token_type() || '#cdata-section' === $processor->get_token_type() ) ) {
@@ -705,7 +747,7 @@ class WXRAttachmentExtractorTest extends TestCase {
 		$this->assertIsString( $cursor );
 		$decoded = json_decode( $cursor, true );
 		$this->assertIsArray( $decoded );
-		$this->assertArrayHasKey( 'reader_cursor', $decoded );
+		$this->assertArrayHasKey( 'xml_cursor', $decoded );
 		$this->assertArrayHasKey( 'seen_urls', $decoded );
 	}
 
@@ -747,17 +789,7 @@ class WXRAttachmentExtractorTest extends TestCase {
 		$output  = $this->run_extractor( $input );
 
 		// Parse with XMLProcessor; it should not fail.
-		$processor = XMLProcessor::create_from_string(
-			$output,
-			null,
-			'UTF-8',
-			array(
-				'wp'      => 'http://wordpress.org/export/1.2/',
-				'content' => 'http://purl.org/rss/1.0/modules/content/',
-				'dc'      => 'http://purl.org/dc/elements/1.1/',
-				'excerpt' => 'http://wordpress.org/export/1.2/excerpt/',
-			)
-		);
+		$processor = XMLProcessor::create_from_string( $output );
 		$token_count = 0;
 		while ( $processor->next_token() ) {
 			++$token_count;

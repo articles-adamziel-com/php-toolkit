@@ -4,8 +4,6 @@ namespace WordPress\DataLiberation\WXRAttachmentExtractor;
 
 use WordPress\ByteStream\ReadStream\ByteReadStream;
 use WordPress\ByteStream\WriteStream\ByteWriteStream;
-use WordPress\DataLiberation\EntityReader\WXREntityReader;
-use WordPress\DataLiberation\ImportEntity;
 use WordPress\DataLiberation\URL\CSSURLProcessor;
 use WordPress\DataLiberation\URL\WPURL;
 use WordPress\XML\XMLProcessor;
@@ -13,21 +11,23 @@ use WP_HTML_Tag_Processor;
 
 /**
  * Streaming, single-pass WXR transformer that reads a WXR file and produces
- * a new WXR file with attachment (type=media) items generated for every image
+ * a new WXR file with attachment (type=media) items generated for every media
  * URL found in post content.
  *
- * The WordPress importer only downloads images when the WXR file contains
+ * The WordPress importer only downloads media when the WXR file contains
  * explicit <item> entries with <wp:post_type>attachment</wp:post_type> and
- * <wp:attachment_url>. Many WXR exports omit these entries, causing image
+ * <wp:attachment_url>. Many WXR exports omit these entries, causing media
  * references in post content to become broken after import.
  *
- * This utility fixes that by scanning each post's content:encoded for image
- * URLs (in <img> tags, CSS background-image url(), srcset attributes, and
- * <video poster>) and generating the missing attachment items.
+ * This utility fixes that by scanning each post's content:encoded for media
+ * URLs (in <img>, <video>, <audio>, <source>, <embed> tags, CSS url(), and
+ * srcset attributes) and generating the missing attachment items.
  *
  * ## Design
  *
- * - Uses WXREntityReader for streaming XML parsing (handles namespace variants)
+ * - Uses XMLProcessor directly for streaming XML token iteration
+ * - Passes raw input bytes through to output verbatim (generic XML pass-through)
+ * - Only injects synthetic attachment <item> elements after </item> closers
  * - Uses WP_HTML_Tag_Processor for HTML parsing (no regex, no DOM)
  * - Uses CSSURLProcessor for CSS url() extraction
  * - Uses WPURL (WHATWG URL parser) for URL parsing and validation
@@ -49,15 +49,29 @@ class WXRAttachmentExtractor {
 	const STATE_FINISHED   = 'finished';
 
 	/**
-	 * Recognised image file extensions (lowercase, without dot).
+	 * HTML tags and their attributes that contain direct media URLs.
 	 */
-	const IMAGE_EXTENSIONS = array(
-		'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico',
-		'avif', 'tiff', 'tif', 'heic', 'heif',
+	const MEDIA_URL_ATTRIBUTES = array(
+		'AUDIO'  => array( 'src' ),
+		'EMBED'  => array( 'src' ),
+		'IMG'    => array( 'src' ),
+		'IMAGE'  => array( 'href' ),
+		'SOURCE' => array( 'src' ),
+		'VIDEO'  => array( 'poster', 'src' ),
 	);
 
 	/**
-	 * XML namespace declarations used in WXR 1.2 output.
+	 * HTML tags and their attributes that contain URLs in sub-syntaxes
+	 * (srcset descriptors, CSS url() values). '*' matches any tag.
+	 */
+	const MEDIA_URL_SUBSYNTAX_ATTRIBUTES = array(
+		'*'      => array( 'style' ),
+		'IMG'    => array( 'srcset' ),
+		'SOURCE' => array( 'srcset' ),
+	);
+
+	/**
+	 * XML namespace declarations used in WXR 1.2 output for synthetic items.
 	 */
 	const WXR_NAMESPACES = array(
 		'excerpt' => 'http://wordpress.org/export/1.2/excerpt/',
@@ -67,14 +81,38 @@ class WXRAttachmentExtractor {
 		'wp'      => 'http://wordpress.org/export/1.2/',
 	);
 
-	/** @var WXREntityReader */
-	private $reader;
+	/**
+	 * All known WXR namespace URI variants (http/https × versions 1.0/1.1/1.2).
+	 */
+	private static $wxr_namespace_uris = array(
+		'http://wordpress.org/export/1.0/',
+		'https://wordpress.org/export/1.0/',
+		'http://wordpress.org/export/1.1/',
+		'https://wordpress.org/export/1.1/',
+		'http://wordpress.org/export/1.2/',
+		'https://wordpress.org/export/1.2/',
+	);
+
+	/** @var XMLProcessor */
+	private $xml;
+
+	/** @var ByteReadStream|null */
+	private $upstream;
 
 	/** @var ByteWriteStream */
 	private $output;
 
 	/** @var URLSeenTracker */
 	private $url_tracker;
+
+	/** @var string Raw input bytes not yet written to output. */
+	private $raw_buffer = '';
+
+	/** @var int Cumulative stream offset of $raw_buffer[0]. */
+	private $raw_buffer_base_offset = 0;
+
+	/** @var int Cumulative stream offset of bytes already written to output. */
+	private $output_cursor = 0;
 
 	/** @var int Next post_id for generated attachments. */
 	private $next_attachment_id;
@@ -85,20 +123,32 @@ class WXRAttachmentExtractor {
 	/** @var string Current processing state. */
 	private $state;
 
-	/** @var bool Whether the XML header has been written to output. */
-	private $header_written = false;
-
-	/** @var array Pending image URLs to emit as attachments after closing the current item. */
-	private $pending_urls = array();
-
-	/** @var string|null Current post's ID (for post_parent on attachments). */
-	private $current_post_id = null;
-
-	/** @var bool Whether an <item> tag is currently open in the output. */
-	private $item_open = false;
-
 	/** @var string|null Base URL from the WXR for resolving relative URLs. */
 	private $base_url = null;
+
+	/** @var bool Whether we are inside an <item> element. */
+	private $in_item = false;
+
+	/** @var string|null Tag name whose text content we are accumulating. */
+	private $accumulating_tag = null;
+
+	/** @var string Text accumulator for the current tag. */
+	private $text_buffer = '';
+
+	/** @var string|null Current item's wp:post_id text. */
+	private $current_item_post_id = null;
+
+	/** @var string|null Current item's wp:post_type text. */
+	private $current_item_post_type = null;
+
+	/** @var string|null Current item's wp:attachment_url text. */
+	private $current_item_attachment_url = null;
+
+	/** @var string|null Current item's content:encoded text. */
+	private $current_item_content = null;
+
+	/** @var int Total bytes consumed from the upstream stream. */
+	private $upstream_bytes_consumed = 0;
 
 	/**
 	 * Create a new extractor.
@@ -116,34 +166,44 @@ class WXRAttachmentExtractor {
 		?URLSeenTracker $url_tracker = null,
 		?string $cursor = null
 	) {
-		$reader_cursor = null;
-		$state_data    = null;
+		$xml_cursor = null;
+		$state_data = null;
 
 		if ( null !== $cursor ) {
 			$state_data = json_decode( $cursor, true );
 			if ( ! is_array( $state_data ) ) {
 				return false;
 			}
-			$reader_cursor = $state_data['reader_cursor'] ?? null;
+			$xml_cursor = $state_data['xml_cursor'] ?? null;
 		}
 
-		$reader = WXREntityReader::create( $input, $reader_cursor );
-		if ( false === $reader ) {
+		$xml = XMLProcessor::create_for_streaming( '', $xml_cursor );
+		if ( null === $xml ) {
 			return false;
 		}
 
-		$extractor         = new self();
-		$extractor->reader = $reader;
-		$extractor->output = $output;
+		$extractor           = new self();
+		$extractor->xml      = $xml;
+		$extractor->upstream = $input;
+		$extractor->output   = $output;
 
 		if ( null !== $state_data ) {
-			$extractor->url_tracker        = $url_tracker ?? new InMemoryURLSeenTracker( $state_data['seen_urls'] ?? array() );
-			$extractor->next_attachment_id = $state_data['next_attachment_id'] ?? 100000;
-			$extractor->max_post_id_seen   = $state_data['max_post_id_seen'] ?? 0;
-			$extractor->header_written     = $state_data['header_written'] ?? false;
-			$extractor->state              = $state_data['state'] ?? self::STATE_PROCESSING;
-			$extractor->item_open          = $state_data['item_open'] ?? false;
-			$extractor->base_url           = $state_data['base_url'] ?? null;
+			$extractor->url_tracker                 = $url_tracker ?? new InMemoryURLSeenTracker( $state_data['seen_urls'] ?? array() );
+			$extractor->next_attachment_id          = $state_data['next_attachment_id'] ?? 100000;
+			$extractor->max_post_id_seen            = $state_data['max_post_id_seen'] ?? 0;
+			$extractor->state                       = $state_data['state'] ?? self::STATE_PROCESSING;
+			$extractor->base_url                    = $state_data['base_url'] ?? null;
+			$extractor->output_cursor               = $state_data['output_cursor'] ?? 0;
+			$extractor->raw_buffer_base_offset      = $state_data['raw_buffer_base_offset'] ?? 0;
+			$extractor->in_item                     = $state_data['in_item'] ?? false;
+			$extractor->current_item_post_id        = $state_data['current_item_post_id'] ?? null;
+			$extractor->current_item_post_type      = $state_data['current_item_post_type'] ?? null;
+			$extractor->current_item_attachment_url = $state_data['current_item_attachment_url'] ?? null;
+			$extractor->current_item_content        = $state_data['current_item_content'] ?? null;
+			if ( isset( $state_data['upstream_offset'] ) ) {
+				$input->seek( $state_data['upstream_offset'] );
+				$extractor->upstream_bytes_consumed = $state_data['upstream_offset'];
+			}
 		} else {
 			$extractor->url_tracker        = $url_tracker ?? new InMemoryURLSeenTracker();
 			$extractor->next_attachment_id = 100000;
@@ -165,29 +225,32 @@ class WXRAttachmentExtractor {
 			return false;
 		}
 
-		if ( ! $this->header_written ) {
-			$this->write_header();
-			$this->header_written = true;
-		}
-
-		// Read the next entity from the input WXR.
-		if ( ! $this->reader->next_entity() ) {
-			if ( $this->reader->is_paused_at_incomplete_input() ) {
+		// Try to advance to the next XML token.
+		if ( ! $this->xml->next_token() ) {
+			if ( $this->xml->is_paused_at_incomplete_input() ) {
+				// Need more bytes from upstream.
+				if ( $this->pull_upstream_bytes() ) {
+					return true;
+				}
+				if ( $this->upstream && $this->upstream->reached_end_of_data() ) {
+					$this->xml->input_finished();
+					return true;
+				}
 				return false;
 			}
-			// Input exhausted – flush remaining attachments and close.
-			$this->close_item_and_flush_attachments();
-			$this->write_footer();
+			// Document complete or error – flush remaining bytes.
+			$this->flush_raw_bytes_to_end();
 			$this->state = self::STATE_FINISHED;
 			return false;
 		}
 
-		$entity = $this->reader->get_entity();
-		if ( false === $entity ) {
-			return true;
-		}
+		// Flush raw input bytes through the end of this token to output.
+		$token_end_offset = $this->xml->bytes_already_parsed + $this->xml->upstream_bytes_forgotten;
+		$this->flush_raw_bytes_up_to( $token_end_offset );
 
-		$this->process_entity( $entity );
+		// Process the token for state tracking and attachment injection.
+		$this->process_token();
+
 		return true;
 	}
 
@@ -202,69 +265,127 @@ class WXRAttachmentExtractor {
 	 * Whether the extractor is paused waiting for more input bytes.
 	 */
 	public function is_paused_at_incomplete_input(): bool {
-		return $this->reader->is_paused_at_incomplete_input();
+		return $this->xml->is_paused_at_incomplete_input();
 	}
 
 	/**
 	 * Serialise the current state so processing can be resumed later.
 	 */
 	public function get_reentrancy_cursor(): string {
-		return json_encode( array(
-			'reader_cursor'      => $this->reader->get_reentrancy_cursor(),
-			'next_attachment_id' => $this->next_attachment_id,
-			'max_post_id_seen'   => $this->max_post_id_seen,
-			'header_written'     => $this->header_written,
-			'state'              => $this->state,
-			'item_open'          => $this->item_open,
-			'base_url'           => $this->base_url,
-			'seen_urls'          => $this->url_tracker->get_all_seen(),
-		) );
+		return json_encode(
+			array(
+				'xml_cursor'                 => $this->xml->get_reentrancy_cursor(),
+				'next_attachment_id'         => $this->next_attachment_id,
+				'max_post_id_seen'           => $this->max_post_id_seen,
+				'state'                      => $this->state,
+				'base_url'                   => $this->base_url,
+				'output_cursor'              => $this->output_cursor,
+				'raw_buffer_base_offset'     => $this->raw_buffer_base_offset,
+				'upstream_offset'            => $this->upstream_bytes_consumed,
+				'in_item'                    => $this->in_item,
+				'current_item_post_id'       => $this->current_item_post_id,
+				'current_item_post_type'     => $this->current_item_post_type,
+				'current_item_attachment_url' => $this->current_item_attachment_url,
+				'current_item_content'       => $this->current_item_content,
+				'seen_urls'                  => $this->url_tracker->get_all_seen(),
+			)
+		);
 	}
 
-	// ─── Entity processing ────────────────────────────────────────
+	// ─── Token processing ────────────────────────────────────────
 
-	private function process_entity( ImportEntity $entity ) {
-		switch ( $entity->get_type() ) {
-			case 'post':
-				$this->process_post( $entity );
-				break;
-			case 'post_meta':
-				$this->write_post_meta( $entity->get_data() );
-				break;
-			case 'comment':
-				$this->write_comment( $entity->get_data() );
-				break;
-			case 'user':
-				$this->close_item_and_flush_attachments();
-				$this->write_author( $entity->get_data() );
-				break;
-			case 'category':
-				$this->close_item_and_flush_attachments();
-				$this->write_category( $entity->get_data() );
-				break;
-			case 'tag':
-				$this->close_item_and_flush_attachments();
-				$this->write_tag( $entity->get_data() );
-				break;
-			case 'term':
-				$this->close_item_and_flush_attachments();
-				$this->write_term( $entity->get_data() );
-				break;
-			case 'site_option':
-				$this->process_site_option( $entity->get_data() );
-				break;
+	private function process_token() {
+		$token_type = $this->xml->get_token_type();
+
+		if ( '#tag' === $token_type ) {
+			if ( $this->xml->is_tag_opener() ) {
+				$this->process_tag_opener();
+			} elseif ( $this->xml->is_tag_closer() ) {
+				$this->process_tag_closer();
+			}
+		} elseif (
+			null !== $this->accumulating_tag &&
+			( '#text' === $token_type || '#cdata-section' === $token_type )
+		) {
+			$this->text_buffer .= $this->xml->get_modifiable_text();
 		}
 	}
 
-	private function process_post( ImportEntity $entity ) {
-		// Close the previous item and emit its pending attachments.
-		$this->close_item_and_flush_attachments();
+	private function process_tag_opener() {
+		$ns_local    = $this->xml->get_tag_namespace_and_local_name();
+		$breadcrumbs = $this->xml->get_breadcrumbs();
+		$depth       = count( $breadcrumbs );
 
-		$data = $entity->get_data();
+		// <item> at depth 3 (rss > channel > item).
+		if ( 'item' === $ns_local && 3 === $depth ) {
+			$this->begin_item();
+			return;
+		}
 
-		// Track the highest post_id for attachment ID generation.
-		if ( ! empty( $data['post_id'] ) ) {
-			$id = (int) $data['post_id'];
+		if ( $this->in_item && 4 === $depth ) {
+			// Fields inside an <item>.
+			if ( $this->is_wxr_tag( 'post_type', $ns_local ) ) {
+				$this->accumulating_tag = 'post_type';
+				$this->text_buffer      = '';
+			} elseif ( $this->is_wxr_tag( 'post_id', $ns_local ) ) {
+				$this->accumulating_tag = 'post_id';
+				$this->text_buffer      = '';
+			} elseif ( $this->is_wxr_tag( 'attachment_url', $ns_local ) ) {
+				$this->accumulating_tag = 'attachment_url';
+				$this->text_buffer      = '';
+			} elseif ( $this->is_content_encoded( $ns_local ) ) {
+				$this->accumulating_tag = 'content';
+				$this->text_buffer      = '';
+			}
+		} elseif ( ! $this->in_item && 3 === $depth ) {
+			// Base URLs outside items (channel-level).
+			if ( $this->is_wxr_tag( 'base_blog_url', $ns_local ) ) {
+				$this->accumulating_tag = 'base_blog_url';
+				$this->text_buffer      = '';
+			} elseif ( $this->is_wxr_tag( 'base_site_url', $ns_local ) ) {
+				$this->accumulating_tag = 'base_site_url';
+				$this->text_buffer      = '';
+			}
+		}
+	}
+
+	private function process_tag_closer() {
+		// Detect </item>: we were inside an item, and after close the depth
+		// drops to 2 (rss > channel).
+		if ( $this->in_item ) {
+			$breadcrumbs = $this->xml->get_breadcrumbs();
+			if ( 2 === count( $breadcrumbs ) ) {
+				$this->end_item();
+				return;
+			}
+		}
+
+		if ( null !== $this->accumulating_tag ) {
+			$this->finish_accumulating();
+		}
+	}
+
+	// ─── Item state management ───────────────────────────────────
+
+	private function begin_item() {
+		$this->in_item                     = true;
+		$this->current_item_post_id        = null;
+		$this->current_item_post_type      = null;
+		$this->current_item_attachment_url = null;
+		$this->current_item_content        = null;
+		$this->accumulating_tag            = null;
+		$this->text_buffer                 = '';
+	}
+
+	private function end_item() {
+		// Finish any ongoing text accumulation.
+		if ( null !== $this->accumulating_tag ) {
+			$this->finish_accumulating();
+		}
+
+		// Track post IDs for attachment ID generation.
+		if ( null !== $this->current_item_post_id ) {
+			$id = (int) $this->current_item_post_id;
 			if ( $id > $this->max_post_id_seen ) {
 				$this->max_post_id_seen = $id;
 			}
@@ -273,92 +394,170 @@ class WXRAttachmentExtractor {
 			}
 		}
 
-		$this->current_post_id = $data['post_id'] ?? null;
-
-		// If this is already an attachment, record its URL.
+		// If this is an existing attachment, record its URL to prevent duplicates.
 		if (
-			isset( $data['post_type'] ) &&
-			'attachment' === $data['post_type'] &&
-			! empty( $data['attachment_url'] )
+			'attachment' === $this->current_item_post_type &&
+			null !== $this->current_item_attachment_url &&
+			'' !== $this->current_item_attachment_url
 		) {
-			$this->url_tracker->mark_seen( $data['attachment_url'] );
+			$this->url_tracker->mark_seen( $this->current_item_attachment_url );
 		}
 
-		// Write the <item> to output.
-		$this->write_item_open( $data );
-		$this->item_open = true;
-
-		// Scan content for image URLs.
-		if ( ! empty( $data['post_content'] ) ) {
-			$this->extract_and_collect_image_urls( $data['post_content'] );
-		}
-	}
-
-	private function process_site_option( array $data ) {
-		if ( 'home' === ( $data['option_name'] ?? '' ) && ! empty( $data['option_value'] ) ) {
-			$this->base_url = $data['option_value'];
-			$this->write_xml_tag( 'wp:base_blog_url', $data['option_value'] );
-		} elseif ( 'siteurl' === ( $data['option_name'] ?? '' ) && ! empty( $data['option_value'] ) ) {
-			if ( null === $this->base_url ) {
-				$this->base_url = $data['option_value'];
+		// Extract media URLs from content and inject attachment items.
+		if ( null !== $this->current_item_content && '' !== $this->current_item_content ) {
+			$urls = $this->extract_media_urls( $this->current_item_content );
+			foreach ( $urls as $url ) {
+				if ( ! $this->url_tracker->has_seen( $url ) ) {
+					$this->url_tracker->mark_seen( $url );
+					$this->write_attachment_item( $url );
+				}
 			}
-			$this->write_xml_tag( 'wp:base_site_url', $data['option_value'] );
-		} elseif ( 'blogname' === ( $data['option_name'] ?? '' ) ) {
-			$this->write_xml_tag( 'title', $data['option_value'] ?? '' );
+		}
+
+		// Reset item state.
+		$this->in_item                     = false;
+		$this->current_item_post_id        = null;
+		$this->current_item_post_type      = null;
+		$this->current_item_attachment_url = null;
+		$this->current_item_content        = null;
+	}
+
+	private function finish_accumulating() {
+		$tag  = $this->accumulating_tag;
+		$text = $this->text_buffer;
+
+		$this->accumulating_tag = null;
+		$this->text_buffer      = '';
+
+		switch ( $tag ) {
+			case 'post_type':
+				$this->current_item_post_type = trim( $text );
+				break;
+			case 'post_id':
+				$this->current_item_post_id = trim( $text );
+				break;
+			case 'attachment_url':
+				$this->current_item_attachment_url = trim( $text );
+				break;
+			case 'content':
+				$this->current_item_content = $text;
+				break;
+			case 'base_blog_url':
+				$this->base_url = trim( $text );
+				break;
+			case 'base_site_url':
+				if ( null === $this->base_url ) {
+					$this->base_url = trim( $text );
+				}
+				break;
 		}
 	}
 
-	// ─── Image URL extraction ─────────────────────────────────────
+	// ─── Namespace helpers ───────────────────────────────────────
 
 	/**
-	 * Extract image URLs from HTML content and collect new ones as pending.
+	 * Check whether a namespace+local tag name matches any WXR namespace variant
+	 * for the given local name.
 	 */
-	private function extract_and_collect_image_urls( string $html ) {
-		$urls = $this->extract_image_urls( $html );
-		foreach ( $urls as $url ) {
-			if ( ! $this->url_tracker->has_seen( $url ) ) {
-				$this->url_tracker->mark_seen( $url );
-				$this->pending_urls[] = $url;
+	private function is_wxr_tag( string $local_name, string $ns_local ): bool {
+		foreach ( self::$wxr_namespace_uris as $ns ) {
+			if ( '{' . $ns . '}' . $local_name === $ns_local ) {
+				return true;
 			}
+		}
+		return false;
+	}
+
+	/**
+	 * Check whether a namespace+local tag name is content:encoded.
+	 */
+	private function is_content_encoded( string $ns_local ): bool {
+		return '{http://purl.org/rss/1.0/modules/content/}encoded' === $ns_local;
+	}
+
+	// ─── Raw byte management ─────────────────────────────────────
+
+	/**
+	 * Pull the next chunk of bytes from the upstream stream, feeding both
+	 * the XMLProcessor and the raw buffer.
+	 */
+	private function pull_upstream_bytes(): bool {
+		if ( ! $this->upstream || $this->upstream->reached_end_of_data() ) {
+			return false;
+		}
+
+		$available = $this->upstream->pull( 65536 );
+		if ( 0 === $available ) {
+			return false;
+		}
+
+		$bytes = $this->upstream->consume( $available );
+		$this->xml->append_bytes( $bytes );
+		$this->raw_buffer              .= $bytes;
+		$this->upstream_bytes_consumed += strlen( $bytes );
+
+		return true;
+	}
+
+	/**
+	 * Copy raw input bytes from the buffer to output up to the given
+	 * cumulative stream offset, then trim the consumed portion.
+	 */
+	private function flush_raw_bytes_up_to( int $offset ) {
+		if ( $offset <= $this->output_cursor ) {
+			return;
+		}
+
+		$start_in_buffer = $this->output_cursor - $this->raw_buffer_base_offset;
+		$length          = $offset - $this->output_cursor;
+
+		if ( $length > 0 && $start_in_buffer >= 0 ) {
+			$this->output->append_bytes( substr( $this->raw_buffer, $start_in_buffer, $length ) );
+		}
+
+		$this->output_cursor = $offset;
+
+		// Trim consumed bytes from the raw buffer.
+		$consumed = $this->output_cursor - $this->raw_buffer_base_offset;
+		if ( $consumed > 0 ) {
+			$this->raw_buffer             = substr( $this->raw_buffer, $consumed );
+			$this->raw_buffer_base_offset = $this->output_cursor;
 		}
 	}
 
 	/**
-	 * Parse HTML and return all image URLs found.
-	 *
-	 * Sources:
-	 * - <img src="...">
-	 * - <img srcset="..."> (each URL)
-	 * - <video poster="...">
-	 * - <source src="..." type="image/...">
-	 * - CSS url() in style attributes
+	 * Flush all remaining raw bytes to output.
+	 */
+	private function flush_raw_bytes_to_end() {
+		if ( '' !== $this->raw_buffer ) {
+			$this->output->append_bytes( $this->raw_buffer );
+			$this->output_cursor          = $this->raw_buffer_base_offset + strlen( $this->raw_buffer );
+			$this->raw_buffer             = '';
+			$this->raw_buffer_base_offset = $this->output_cursor;
+		}
+	}
+
+	// ─── Media URL extraction ────────────────────────────────────
+
+	/**
+	 * Extract media URLs from HTML content using data-driven tag/attribute lists.
 	 *
 	 * @param string $html The HTML content to scan.
-	 * @return array List of absolute image URL strings.
+	 * @return array List of absolute media URL strings.
 	 */
-	private function extract_image_urls( string $html ): array {
+	private function extract_media_urls( string $html ): array {
 		$urls = array();
 		$tags = new WP_HTML_Tag_Processor( $html );
 
 		while ( $tags->next_tag() ) {
 			$tag_name = strtoupper( $tags->get_tag() );
 
-			// <img src="...">
-			if ( 'IMG' === $tag_name ) {
-				$src = $tags->get_attribute( 'src' );
-				if ( is_string( $src ) ) {
-					$resolved = $this->resolve_url( $src );
-					if ( null !== $resolved ) {
-						$urls[] = $resolved;
-					}
-				}
-
-				// <img srcset="url 300w, url 600w, ...">
-				$srcset = $tags->get_attribute( 'srcset' );
-				if ( is_string( $srcset ) ) {
-					$srcset_urls = $this->parse_srcset_urls( $srcset );
-					foreach ( $srcset_urls as $srcset_url ) {
-						$resolved = $this->resolve_url( $srcset_url );
+			// Direct URL attributes.
+			if ( isset( self::MEDIA_URL_ATTRIBUTES[ $tag_name ] ) ) {
+				foreach ( self::MEDIA_URL_ATTRIBUTES[ $tag_name ] as $attr ) {
+					$value = $tags->get_attribute( $attr );
+					if ( is_string( $value ) ) {
+						$resolved = $this->resolve_url( $value );
 						if ( null !== $resolved ) {
 							$urls[] = $resolved;
 						}
@@ -366,51 +565,36 @@ class WXRAttachmentExtractor {
 				}
 			}
 
-			// <video poster="...">
-			if ( 'VIDEO' === $tag_name ) {
-				$poster = $tags->get_attribute( 'poster' );
-				if ( is_string( $poster ) ) {
-					$resolved = $this->resolve_url( $poster );
-					if ( null !== $resolved ) {
-						$urls[] = $resolved;
-					}
-				}
+			// Sub-syntax attributes (srcset, style) – merge wildcard and tag-specific.
+			$subsyntax_attrs = array();
+			if ( isset( self::MEDIA_URL_SUBSYNTAX_ATTRIBUTES['*'] ) ) {
+				$subsyntax_attrs = self::MEDIA_URL_SUBSYNTAX_ATTRIBUTES['*'];
+			}
+			if ( isset( self::MEDIA_URL_SUBSYNTAX_ATTRIBUTES[ $tag_name ] ) ) {
+				$subsyntax_attrs = array_unique(
+					array_merge(
+						$subsyntax_attrs,
+						self::MEDIA_URL_SUBSYNTAX_ATTRIBUTES[ $tag_name ]
+					)
+				);
 			}
 
-			// <source src="..." type="image/...">
-			if ( 'SOURCE' === $tag_name ) {
-				$type = $tags->get_attribute( 'type' );
-				$src  = $tags->get_attribute( 'src' );
-				if (
-					is_string( $src ) &&
-					is_string( $type ) &&
-					0 === strncasecmp( $type, 'image/', 6 )
-				) {
-					$resolved = $this->resolve_url( $src );
-					if ( null !== $resolved ) {
-						$urls[] = $resolved;
-					}
+			foreach ( $subsyntax_attrs as $attr ) {
+				$value = $tags->get_attribute( $attr );
+				if ( ! is_string( $value ) || '' === $value ) {
+					continue;
 				}
-
-				// <source srcset="...">
-				$srcset = $tags->get_attribute( 'srcset' );
-				if ( is_string( $srcset ) ) {
-					$srcset_urls = $this->parse_srcset_urls( $srcset );
-					foreach ( $srcset_urls as $srcset_url ) {
+				if ( 'srcset' === $attr ) {
+					foreach ( $this->parse_srcset_urls( $value ) as $srcset_url ) {
 						$resolved = $this->resolve_url( $srcset_url );
 						if ( null !== $resolved ) {
 							$urls[] = $resolved;
 						}
 					}
-				}
-			}
-
-			// CSS url() in style attributes.
-			$style = $tags->get_attribute( 'style' );
-			if ( is_string( $style ) && strlen( $style ) > 0 ) {
-				$css_urls = $this->extract_urls_from_css( $style );
-				foreach ( $css_urls as $css_url ) {
-					$urls[] = $css_url;
+				} elseif ( 'style' === $attr ) {
+					foreach ( $this->extract_urls_from_css( $value ) as $css_url ) {
+						$urls[] = $css_url;
+					}
 				}
 			}
 		}
@@ -419,10 +603,10 @@ class WXRAttachmentExtractor {
 	}
 
 	/**
-	 * Extract image URLs from a CSS style string using CSSURLProcessor.
+	 * Extract URLs from a CSS style string using CSSURLProcessor.
 	 *
 	 * @param string $css CSS property declarations (e.g. from a style attribute).
-	 * @return array List of absolute image URL strings.
+	 * @return array List of absolute URL strings.
 	 */
 	private function extract_urls_from_css( string $css ): array {
 		$urls          = array();
@@ -437,7 +621,7 @@ class WXRAttachmentExtractor {
 				continue;
 			}
 			$resolved = $this->resolve_url( $raw_url );
-			if ( null !== $resolved && $this->looks_like_image_url( $resolved ) ) {
+			if ( null !== $resolved ) {
 				$urls[] = $resolved;
 			}
 		}
@@ -521,50 +705,10 @@ class WXRAttachmentExtractor {
 		return null;
 	}
 
-	/**
-	 * Check whether a URL path ends with a known image file extension.
-	 *
-	 * Used for CSS url() values where we need to distinguish images
-	 * from fonts, SVG icons used as masks, etc.
-	 *
-	 * @param string $url An absolute URL.
-	 * @return bool
-	 */
-	private function looks_like_image_url( string $url ): bool {
-		$parsed = WPURL::parse( $url );
-		if ( false === $parsed ) {
-			return false;
-		}
-
-		$path = $parsed->pathname;
-		$dot  = strrpos( $path, '.' );
-		if ( false === $dot ) {
-			return false;
-		}
-
-		$ext = strtolower( substr( $path, $dot + 1 ) );
-		return in_array( $ext, self::IMAGE_EXTENSIONS, true );
-	}
-
-	// ─── Attachment emission ──────────────────────────────────────
+	// ─── Attachment emission ─────────────────────────────────────
 
 	/**
-	 * Close the current <item> and emit any pending attachment items.
-	 */
-	private function close_item_and_flush_attachments() {
-		if ( $this->item_open ) {
-			$this->output->append_bytes( "</item>\n" );
-			$this->item_open = false;
-		}
-
-		foreach ( $this->pending_urls as $url ) {
-			$this->write_attachment_item( $url );
-		}
-		$this->pending_urls = array();
-	}
-
-	/**
-	 * Write a complete attachment <item> for the given image URL.
+	 * Write a complete attachment <item> for the given media URL.
 	 */
 	private function write_attachment_item( string $url ) {
 		$id        = $this->next_attachment_id++;
@@ -581,7 +725,7 @@ class WXRAttachmentExtractor {
 		$this->write_xml_tag( 'wp:ping_status', 'closed' );
 		$this->write_xml_tag( 'wp:post_name', $post_name );
 		$this->write_xml_tag( 'wp:status', 'inherit' );
-		$this->write_xml_tag( 'wp:post_parent', $this->current_post_id ?? '0' );
+		$this->write_xml_tag( 'wp:post_parent', $this->current_item_post_id ?? '0' );
 		$this->write_xml_tag( 'wp:menu_order', '0' );
 		$this->write_xml_tag( 'wp:post_type', 'attachment' );
 		$this->write_xml_tag( 'wp:attachment_url', $url );
@@ -605,7 +749,7 @@ class WXRAttachmentExtractor {
 		$path = $parsed->pathname;
 
 		// Get the filename (last path segment).
-		$slash = strrpos( $path, '/' );
+		$slash    = strrpos( $path, '/' );
 		$filename = ( false !== $slash ) ? substr( $path, $slash + 1 ) : $path;
 
 		// Remove the extension.
@@ -624,25 +768,7 @@ class WXRAttachmentExtractor {
 		return $filename;
 	}
 
-	// ─── XML output helpers ───────────────────────────────────────
-
-	private function write_header() {
-		$this->output->append_bytes(
-			"<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n"
-			. '<rss version="2.0"'
-			. ' xmlns:excerpt="http://wordpress.org/export/1.2/excerpt/"'
-			. ' xmlns:content="http://purl.org/rss/1.0/modules/content/"'
-			. ' xmlns:wfw="http://wellformedweb.org/CommentAPI/"'
-			. ' xmlns:dc="http://purl.org/dc/elements/1.1/"'
-			. ' xmlns:wp="http://wordpress.org/export/1.2/"'
-			. ">\n<channel>\n"
-			. "<wp:wxr_version>1.2</wp:wxr_version>\n"
-		);
-	}
-
-	private function write_footer() {
-		$this->output->append_bytes( "</channel>\n</rss>\n" );
-	}
+	// ─── XML output helpers ──────────────────────────────────────
 
 	/**
 	 * Write a single XML tag with properly encoded text content.
@@ -661,197 +787,5 @@ class WXRAttachmentExtractor {
 		$xml->set_modifiable_text( $content );
 
 		$this->output->append_bytes( $xml->get_updated_xml() );
-	}
-
-	/**
-	 * Write an <item> opening and all its standard post fields.
-	 *
-	 * The fields come from WXREntityReader's post entity data.
-	 */
-	private function write_item_open( array $data ) {
-		$this->output->append_bytes( "<item>\n" );
-
-		$field_map = array(
-			'post_title'       => 'title',
-			'guid'             => 'guid',
-			'post_content'     => 'content:encoded',
-			'post_excerpt'     => 'excerpt:encoded',
-			'post_author'      => 'dc:creator',
-			'post_id'          => 'wp:post_id',
-			'post_date'        => 'wp:post_date',
-			'post_date_gmt'    => 'wp:post_date_gmt',
-			'post_modified'    => 'wp:post_modified',
-			'post_modified_gmt' => 'wp:post_modified_gmt',
-			'comment_status'   => 'wp:comment_status',
-			'ping_status'      => 'wp:ping_status',
-			'post_name'        => 'wp:post_name',
-			'post_status'      => 'wp:status',
-			'post_parent'      => 'wp:post_parent',
-			'menu_order'       => 'wp:menu_order',
-			'post_type'        => 'wp:post_type',
-			'post_password'    => 'wp:post_password',
-			'is_sticky'        => 'wp:is_sticky',
-			'attachment_url'   => 'wp:attachment_url',
-		);
-
-		// Write link and pubDate first (RSS standard fields).
-		if ( ! empty( $data['link'] ) ) {
-			$this->write_xml_tag( 'link', $data['link'] );
-		}
-		if ( ! empty( $data['post_published_at'] ) ) {
-			$this->write_xml_tag( 'pubDate', $data['post_published_at'] );
-		}
-
-		foreach ( $field_map as $reader_key => $xml_tag ) {
-			if ( isset( $data[ $reader_key ] ) && '' !== $data[ $reader_key ] ) {
-				$this->write_xml_tag( $xml_tag, $data[ $reader_key ] );
-			}
-		}
-
-		// Write category terms if present.
-		if ( ! empty( $data['terms'] ) && is_array( $data['terms'] ) ) {
-			foreach ( $data['terms'] as $term ) {
-				$taxonomy = $term['taxonomy'] ?? 'category';
-				$slug     = $term['slug'] ?? '';
-				$name     = $term['description'] ?? '';
-				$xml      = XMLProcessor::create_from_string(
-					"<category domain=\"d\" nicename=\"n\">text</category>\n",
-					null,
-					'UTF-8',
-					self::WXR_NAMESPACES
-				);
-				$xml->next_tag();
-				$xml->set_attribute( '', 'domain', $taxonomy );
-				$xml->set_attribute( '', 'nicename', $slug );
-				$xml->next_token(); // to text node
-				$xml->set_modifiable_text( $name );
-				$this->output->append_bytes( $xml->get_updated_xml() );
-			}
-		}
-	}
-
-	/**
-	 * Write a <wp:postmeta> element.
-	 */
-	private function write_post_meta( array $data ) {
-		$this->output->append_bytes( "<wp:postmeta>\n" );
-		if ( isset( $data['meta_key'] ) ) {
-			$this->write_xml_tag( 'wp:meta_key', $data['meta_key'] );
-		}
-		if ( isset( $data['meta_value'] ) ) {
-			$this->write_xml_tag( 'wp:meta_value', $data['meta_value'] );
-		}
-		$this->output->append_bytes( "</wp:postmeta>\n" );
-	}
-
-	/**
-	 * Write a <wp:comment> element.
-	 */
-	private function write_comment( array $data ) {
-		$this->output->append_bytes( "<wp:comment>\n" );
-		$comment_fields = array(
-			'comment_id'           => 'wp:comment_id',
-			'comment_author'       => 'wp:comment_author',
-			'comment_author_email' => 'wp:comment_author_email',
-			'comment_author_url'   => 'wp:comment_author_url',
-			'comment_author_IP'    => 'wp:comment_author_IP',
-			'comment_date'         => 'wp:comment_date',
-			'comment_date_gmt'     => 'wp:comment_date_gmt',
-			'comment_content'      => 'wp:comment_content',
-			'comment_approved'     => 'wp:comment_approved',
-			'comment_type'         => 'wp:comment_type',
-			'comment_parent'       => 'wp:comment_parent',
-			'comment_user_id'      => 'wp:comment_user_id',
-		);
-		foreach ( $comment_fields as $data_key => $xml_tag ) {
-			if ( isset( $data[ $data_key ] ) ) {
-				$this->write_xml_tag( $xml_tag, $data[ $data_key ] );
-			}
-		}
-		$this->output->append_bytes( "</wp:comment>\n" );
-	}
-
-	/**
-	 * Write a <wp:author> element.
-	 */
-	private function write_author( array $data ) {
-		$this->output->append_bytes( "<wp:author>\n" );
-		$fields = array(
-			'ID'           => 'wp:author_id',
-			'user_login'   => 'wp:author_login',
-			'user_email'   => 'wp:author_email',
-			'display_name' => 'wp:author_display_name',
-			'first_name'   => 'wp:author_first_name',
-			'last_name'    => 'wp:author_last_name',
-		);
-		foreach ( $fields as $data_key => $xml_tag ) {
-			if ( isset( $data[ $data_key ] ) ) {
-				$this->write_xml_tag( $xml_tag, $data[ $data_key ] );
-			}
-		}
-		$this->output->append_bytes( "</wp:author>\n" );
-	}
-
-	/**
-	 * Write a <wp:category> element.
-	 */
-	private function write_category( array $data ) {
-		$this->output->append_bytes( "<wp:category>\n" );
-		if ( isset( $data['slug'] ) ) {
-			$this->write_xml_tag( 'wp:category_nicename', $data['slug'] );
-		}
-		if ( isset( $data['parent'] ) ) {
-			$this->write_xml_tag( 'wp:category_parent', $data['parent'] );
-		}
-		if ( isset( $data['name'] ) ) {
-			$this->write_xml_tag( 'wp:cat_name', $data['name'] );
-		}
-		if ( isset( $data['description'] ) ) {
-			$this->write_xml_tag( 'wp:category_description', $data['description'] );
-		}
-		$this->output->append_bytes( "</wp:category>\n" );
-	}
-
-	/**
-	 * Write a <wp:tag> element.
-	 */
-	private function write_tag( array $data ) {
-		$this->output->append_bytes( "<wp:tag>\n" );
-		if ( isset( $data['term_id'] ) ) {
-			$this->write_xml_tag( 'wp:term_id', $data['term_id'] );
-		}
-		if ( isset( $data['slug'] ) ) {
-			$this->write_xml_tag( 'wp:tag_slug', $data['slug'] );
-		}
-		if ( isset( $data['name'] ) ) {
-			$this->write_xml_tag( 'wp:tag_name', $data['name'] );
-		}
-		if ( isset( $data['description'] ) ) {
-			$this->write_xml_tag( 'wp:tag_description', $data['description'] );
-		}
-		$this->output->append_bytes( "</wp:tag>\n" );
-	}
-
-	/**
-	 * Write a <wp:term> element.
-	 */
-	private function write_term( array $data ) {
-		$this->output->append_bytes( "<wp:term>\n" );
-		if ( isset( $data['term_id'] ) ) {
-			$this->write_xml_tag( 'wp:term_id', $data['term_id'] );
-		}
-		if ( isset( $data['taxonomy'] ) ) {
-			$this->write_xml_tag( 'wp:term_taxonomy', $data['taxonomy'] );
-		}
-		if ( isset( $data['slug'] ) ) {
-			$this->write_xml_tag( 'wp:term_slug', $data['slug'] );
-		}
-		if ( isset( $data['parent'] ) ) {
-			$this->write_xml_tag( 'wp:term_parent', $data['parent'] );
-		}
-		if ( isset( $data['name'] ) ) {
-			$this->write_xml_tag( 'wp:term_name', $data['name'] );
-		}
-		$this->output->append_bytes( "</wp:term>\n" );
 	}
 }
